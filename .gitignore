@@ -1,0 +1,51 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.so
+*.egg-info/
+dist/
+build/
+*.egg
+
+# Virtual Environment
+.venv/
+venv/
+env/
+ENV/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Environment
+.env
+.env.local
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Test / Coverage
+.coverage
+htmlcov/
+.pytest_cache/
+
+# Dependencies (keep requirements.txt if you want)
+Pipfile.lock
+poetry.lock
+
+# Logs
+*.log
+
+# Matplotlib / Seaborn output
+exercise/**/*.png
+exercise/**/*.jpg
+exercise/**/*.pdf
+exercise/**/*.svg
