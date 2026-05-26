@@ -1,0 +1,2137 @@
+# 第07章 LangChain 与 LlamaIndex
+
+## 学习目标
+
+1. 理解 LangChain 的核心架构设计：Model I/O、Retrieval、Chains、Agents 四大模块
+2. 掌握 LCEL（LangChain Expression Language）的管道语法与 Runnable 接口
+3. 能独立构建 RAG（检索增强生成）应用和工具调用 Agent
+4. 理解 LlamaIndex 的数据索引与查询引擎架构
+5. 能对本地文档集建立索引并使用多种查询模式检索
+6. 掌握 LangChain vs LlamaIndex 的选型决策
+
+---
+
+## 前置知识
+
+- Python 异步编程基础（`async/await`）：本章部分代码使用异步
+- OpenAI API：Chat Completion、Embedding、Function Calling
+- 向量数据库基础概念：embedding、相似度检索、Chroma（见第05章）
+- Python 类型注解（`typing` 模块）：提高代码可读性
+
+---
+
+## 7.1 LangChain 核心架构
+
+### 7.1.1 什么是 LangChain
+
+LangChain 是一个用于构建 LLM 驱动应用的**编排框架**。它不训练模型，而是在模型之上提供一套"乐高积木"——标准化的组件和连接方式——帮助开发者把 LLM 与外部数据源、工具、记忆等组合在一起。
+
+**为什么需要 LangChain？**
+
+在没有框架的情况下，构建一个"能搜索知识库 + 用工具 + 记得对话历史"的 LLM 应用需要：
+- 手写 embedding 检索逻辑
+- 手写对话历史管理
+- 手写 function calling 解析
+- 手写 prompt 拼接
+
+LangChain 把这些封装成标准接口，让你像搭积木一样组合。
+
+**核心模块（四大支柱）**：
+
+```
+┌─────────────────────────────────────────────────────┐
+│                    LangChain                        │
+├───────────────┬───────────────┬─────────────────────┤
+│  Model I/O    │  Retrieval    │  Chains & Agents    │
+│  ─────────    │  ─────────    │  ───────────────    │
+│  - Prompt     │  - Loader     │  - LLMChain         │
+│  - Chat Model │  - Splitter   │  - SequentialChain  │
+│  - Output     │  - Embedding  │  - RouterChain      │
+│    Parser     │  - VectorStore│  - AgentExecutor    │
+│               │  - Retriever  │  - Tools            │
+├───────────────┴───────────────┴─────────────────────┤
+│                   LCEL (管道语法)                    │
+└─────────────────────────────────────────────────────┘
+```
+
+### 7.1.2 安装与环境
+
+```bash
+pip install langchain langchain-openai langchain-community
+pip install chromadb  # 向量数据库（第05章已安装可跳过）
+pip install tiktoken  # token 计数
+```
+
+```python
+"""
+ex_7_1_hello_langchain.py: LangChain 入门——最简单的 LLM 调用
+演示：LangChain 如何封装 OpenAI 的 Chat Completion
+"""
+import os
+from dotenv import load_dotenv
+
+load_dotenv()
+
+# ====== 方式一：使用 LangChain 的 ChatOpenAI ======
+from langchain_openai import ChatOpenAI
+from langchain_core.messages import HumanMessage, SystemMessage
+
+# 初始化模型
+# 对比：原来的 openai.OpenAI() 变成了 ChatOpenAI()
+llm = ChatOpenAI(
+    model="gpt-4o",                      # 模型名
+    temperature=0.7,                     # 温度（0-2），越高越随机
+    max_tokens=500,                      # 最大输出 token
+    api_key=os.getenv("OPENAI_API_KEY"),  # 可省略（自动读环境变量）
+    # base_url=os.getenv("OPENAI_BASE_URL"),  # 如需代理
+)
+
+# 调用模型
+# LangChain 使用 Message 对象，而不是 dict
+messages = [
+    SystemMessage(content="你是一位中国古典文学教授，回答要引经据典。"),
+    HumanMessage(content="请解释'道可道，非常道'的含义。"),
+]
+
+response = llm.invoke(messages)  # invoke() 是 LangChain 的统一调用接口
+print(response.content)  # .content 获取文本内容
+# 输出类型是 AIMessage，它包含更多元数据:
+# print(response.response_metadata) # 含 token 用量、模型名等
+# print(response.usage_metadata)     # input_tokens, output_tokens
+```
+
+**关键概念**：
+
+- `ChatOpenAI` 是 LangChain 对 OpenAI Chat Completion API 的封装，它返回 `AIMessage` 而非字符串。
+- `invoke()` 是 LangChain 的统一调用接口（所有 Runnable 对象都有这个方法）。
+- `SystemMessage`、`HumanMessage`、`AIMessage` 是 LangChain 的三种消息类型（对应 API 的 system/user/assistant）。
+
+### 7.1.3 Model I/O 详解
+
+Model I/O 是 LangChain 最基础的模块，处理三个环节：**Prompt（输入格式化）→ Model（模型调用）→ Output Parser（输出解析）**。
+
+#### Prompt Template（提示模板）
+
+```python
+"""
+ex_7_2_prompt_template.py: LangChain Prompt Template 详解
+演示：ChatPromptTemplate、Few-Shot、自定义模板
+"""
+from langchain_openai import ChatOpenAI
+from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
+from langchain_core.prompts import FewShotChatMessagePromptTemplate
+from langchain_core.messages import SystemMessage, HumanMessage, AIMessage
+
+llm = ChatOpenAI(model="gpt-4o", temperature=0)
+
+# ====== 1. 基础 ChatPromptTemplate ======
+# 使用 from_messages 构建消息模板
+# 花括号 { } 中的变量会在调用时被填入
+prompt = ChatPromptTemplate.from_messages([
+    ("system", "你是一位{role}。请用{language}回答问题。"),
+    ("human", "{question}"),
+])
+
+# 填入变量，生成最终的消息列表
+messages = prompt.format_messages(
+    role="Python 编程导师",
+    language="中文",
+    question="解释什么是闭包？",
+)
+print("=== 填入变量后的消息 ===")
+for msg in messages:
+    print(f"[{msg.type}] {msg.content}")
+# 输出:
+# [system] 你是一位Python 编程导师。请用中文回答问题。
+# [human] 解释什么是闭包？
+
+# 直接调用
+response = llm.invoke(messages)
+print(f"\n回复: {response.content[:100]}...")
+
+# 也可以用管道语法一步完成（详见 7.2 LCEL）:
+# chain = prompt | llm
+# response = chain.invoke({"role": "...", "language": "...", "question": "..."})
+
+
+# ====== 2. 含对话历史的模板 ======
+# MessagesPlaceholder 可以插入一个消息列表（用于对话历史）
+prompt_with_history = ChatPromptTemplate.from_messages([
+    ("system", "你是一位有用的助手。"),
+    MessagesPlaceholder(variable_name="history"),  # 这里插入历史消息列表
+    ("human", "{input}"),
+])
+
+# 使用示例
+history = [
+    HumanMessage(content="我叫张伟。"),
+    AIMessage(content="你好张伟！有什么可以帮你的？"),
+    HumanMessage(content="我家有三口人。"),
+    AIMessage(content="好的，我记住了。"),
+]
+messages = prompt_with_history.format_messages(
+    history=history,
+    input="我叫什么名字？我家有几口人？",
+)
+# 现在 messages 包含了 system + 历史4条 + 当前输入
+
+
+# ====== 3. Few-Shot 模板（少样本提示） ======
+# 给模型几个"问题→答案"的范例，引导输出格式
+examples = [
+    {"input": "晴天 → sunny", "output": '{"chinese": "晴天", "english": "sunny"}'},
+    {"input": "下雨 → rain", "output": '{"chinese": "下雨", "english": "rain"}'},
+]
+
+example_prompt = ChatPromptTemplate.from_messages([
+    ("human", "{input}"),
+    ("ai", "{output}"),
+])
+
+few_shot_prompt = FewShotChatMessagePromptTemplate(
+    examples=examples,
+    example_prompt=example_prompt,
+    input_variables=["input"],  # 每个范例中要替换的变量
+)
+
+final_prompt = ChatPromptTemplate.from_messages([
+    ("system", "将天气词翻译为 JSON 格式。"),
+    few_shot_prompt,
+    ("human", "{input}"),
+])
+
+print("\n=== Few-Shot 生成的 Prompt ===")
+print(final_prompt.format(input="下雪 → snow"))
+```
+
+#### Output Parser（输出解析器）
+
+```python
+"""
+ex_7_3_output_parser.py: LangChain Output Parser 详解
+演示：将 LLM 原始文本自动解析为 Python 数据结构
+"""
+import json
+from typing import List
+from pydantic import BaseModel, Field
+from langchain_openai import ChatOpenAI
+from langchain_core.prompts import ChatPromptTemplate
+from langchain_core.output_parsers import (
+    StrOutputParser,        # 最简单的：直接返回字符串
+    JsonOutputParser,       # 解析 JSON → dict
+    PydanticOutputParser,   # 解析 JSON → Pydantic 对象（推荐）
+)
+
+llm = ChatOpenAI(model="gpt-4o", temperature=0)
+
+# ====== 1. StrOutputParser: 直接取文本 ======
+# 什么都不做，就是提取 .content
+parser_str = StrOutputParser()
+result = parser_str.parse("这是模型回复的文本")
+print(f"StrOutputParser: {result}")
+
+
+# ====== 2. JsonOutputParser: 解析 JSON ======
+# 适用场景: 需要结构化输出但不需要强类型校验
+parser_json = JsonOutputParser()
+text = '{"name": "张三", "age": 25, "skills": ["Python", "Java"]}'
+result = parser_json.parse(text)
+print(f"\nJsonOutputParser: {result}")
+print(f"类型: {type(result)}, name={result['name']}")
+
+
+# ====== 3. PydanticOutputParser: 解析为 Pydantic 对象（推荐） ======
+# 这可以让你在代码中获得完整的类型提示和自动校验
+
+# 第一步: 定义输出结构
+class MovieReview(BaseModel):
+    """电影评论的结构化输出"""
+    title: str = Field(description="电影名称")
+    rating: float = Field(description="评分，0-10分")
+    summary: str = Field(description="简短评价，50字以内")
+    pros: List[str] = Field(description="优点列表，至少2条")
+    cons: List[str] = Field(description="缺点列表")
+    recommend: bool = Field(description="是否推荐")
+
+# 第二步: 创建解析器
+parser = PydanticOutputParser(pydantic_object=MovieReview)
+
+# 第三步: 把格式说明注入 Prompt
+# parser.get_format_instructions() 会自动生成 JSON schema 的描述
+prompt = ChatPromptTemplate.from_messages([
+    ("system", "你是一位专业影评人。\n{format_instructions}"),
+    ("human", "请评价电影《{movie_name}》"),
+])
+
+# 第四步: 构建并执行链
+chain = prompt | llm | parser
+
+# 调用
+review = chain.invoke({
+    "movie_name": "肖申克的救赎",
+    "format_instructions": parser.get_format_instructions(),
+})
+
+print(f"\n=== 结构化影评 ===")
+print(f"电影: {review.title}")
+print(f"评分: {review.rating}/10")
+print(f"评价: {review.summary}")
+print(f"优点: {', '.join(review.pros)}")
+print(f"缺点: {', '.join(review.cons)}")
+print(f"推荐: {'是' if review.recommend else '否'}")
+print(f"\n类型: {type(review)}   ← 是 MovieReview 对象，不是 dict!")
+
+# 你可以利用 Pydantic 的校验和序列化
+print(f"\nJSON 序列化: {review.model_dump_json(indent=2)}")
+```
+
+**PydanticOutputParser 的工作原理**：
+
+1. 调用 `parser.get_format_instructions()` 生成一段文字，告诉 LLM "你要输出一个 JSON，schema 是这样的..."
+2. LLM 看到这段指令后，输出的 JSON 符合 schema
+3. `parser.parse(llm_output)` 将 JSON 字符串解析为 Pydantic 对象
+4. 如果 JSON 解析失败或 schema 校验不通过，抛出异常
+
+### 7.1.4 Retrieval 模块
+
+Retrieval 是 RAG（Retrieval-Augmented Generation）的核心。它负责"从知识库中找到与用户问题相关的文档片段"。
+
+Retrieval 的五层架构：
+
+```
+Document Loader → Text Splitter → Embedding → Vector Store → Retriever
+     ↓                ↓              ↓             ↓              ↓
+  加载文档        切分文本      向量化文本    存储向量       检索接口
+```
+
+#### Document Loader
+
+```python
+"""
+ex_7_4_document_loader.py: LangChain Document Loader
+演示：加载 TXT、PDF、Markdown、网页等各类数据源
+"""
+from langchain_community.document_loaders import (
+    TextLoader,
+    PyPDFLoader,
+    UnstructuredMarkdownLoader,
+    WebBaseLoader,
+    CSVLoader,
+    DirectoryLoader,
+)
+
+# ====== 1. 加载纯文本 (.txt) ======
+# 最简单、最常用的 loader
+loader = TextLoader("./data/readme.txt", encoding="utf-8")
+docs = loader.load()  # 返回 List[Document]
+print(f"TXT: 加载了 {len(docs)} 个文档")
+# 每个 Document 对象包含:
+#   - page_content: 文本内容
+#   - metadata: 元数据（如 source 文件路径）
+
+# ====== 2. 加载 PDF ======
+# 需要安装: pip install pypdf
+try:
+    loader = PyPDFLoader("./data/report.pdf")
+    docs = loader.load()  # 默认每页为一个 Document
+    print(f"PDF: 加载了 {len(docs)} 页")
+    for i, doc in enumerate(docs[:3]):
+        print(f"  第{i+1}页: {len(doc.page_content)} 字符")
+except Exception as e:
+    print(f"PDF 加载跳过: {e}")
+
+# ====== 3. 加载 Markdown ======
+# 需要安装: pip install unstructured markdown
+try:
+    loader = UnstructuredMarkdownLoader("./data/doc.md")
+    docs = loader.load()
+    print(f"Markdown: 加载了 {len(docs)} 个文档")
+except Exception as e:
+    print(f"Markdown 加载跳过: {e}")
+
+# ====== 4. 加载网页 ======
+# 需要安装: pip install beautifulsoup4
+try:
+    loader = WebBaseLoader("https://docs.python.org/3/tutorial/index.html")
+    # 网页内容需要清理 HTML 标签，WebBaseLoader 会自动处理
+    docs = loader.load()
+    print(f"网页: 加载了 {len(docs)} 个文档，总字符数: {len(docs[0].page_content)}")
+except Exception as e:
+    print(f"网页加载跳过: {e}")
+
+# ====== 5. 加载 CSV ======
+loader = CSVLoader("./data/data.csv")  # 每行变为一个 Document
+try:
+    docs = loader.load()
+    print(f"CSV: 加载了 {len(docs)} 行")
+except Exception as e:
+    print(f"CSV 加载跳过: {e}")
+
+# ====== 6. 批量加载目录 ======
+# 加载整个目录中所有匹配的文件
+try:
+    loader = DirectoryLoader(
+        "./docs/",
+        glob="**/*.txt",  # 匹配所有 txt 文件
+        loader_cls=TextLoader,  # 用什么 loader 处理每个文件
+        show_progress=True,  # 显示进度条
+    )
+    docs = loader.load()
+    print(f"目录: 加载了 {len(docs)} 个 txt 文件")
+except Exception as e:
+    print(f"目录加载跳过: {e}")
+```
+
+#### Text Splitter（文本切分）
+
+这可能是 RAG 中最被低估的步骤。切分质量直接影响检索准确率。
+
+```python
+"""
+ex_7_5_text_splitter.py: LangChain Text Splitter 详解
+演示：各种切分策略及其对检索质量的影响
+"""
+from langchain_text_splitters import (
+    RecursiveCharacterTextSplitter,  # 最常用的递归切分器
+    CharacterTextSplitter,           # 按固定字符切分
+    MarkdownHeaderTextSplitter,      # 按 Markdown 标题层级切分
+    TokenTextSplitter,               # 按 token 数量切分
+)
+
+# 准备一段测试文本
+sample_text = """
+# 第一章 Python 基础
+
+Python 是一种解释型、面向对象的高级编程语言。由 Guido van Rossum 于 1991 年首次发布。
+
+## 1.1 变量与类型
+
+Python 是动态类型语言，变量不需要声明类型。常见的数据类型包括：
+- int: 整数，如 42
+- float: 浮点数，如 3.14
+- str: 字符串，如 "Hello"
+- list: 列表，如 [1, 2, 3]
+- dict: 字典，如 {"key": "value"}
+
+## 1.2 控制流
+
+Python 使用缩进来表示代码块。
+
+if 语句的基本格式：
+if condition:
+    do_something()
+elif other_condition:
+    do_other()
+else:
+    do_default()
+
+循环有 for 和 while 两种。
+for item in iterable:
+    process(item)
+"""
+
+
+# ====== 1. RecursiveCharacterTextSplitter（推荐） ======
+# 原理: 先尝试用双换行("\n\n")切分；若某段仍太大，再用单换行("\n")；还不够用空格(" ")；
+#       最终按字符切。这样最大程度保留自然段落边界。
+splitter = RecursiveCharacterTextSplitter(
+    chunk_size=200,     # 每块最多 200 字符
+    chunk_overlap=40,   # 块与块之间重叠 40 字符
+    separators=["\n\n", "\n", "。", ".", " ", ""],  # 优先级从高到低
+    length_function=len,  # 长度计算函数
+)
+chunks = splitter.create_documents([sample_text])
+print(f"RecursiveCharacterTextSplitter: {len(chunks)} 块")
+for i, chunk in enumerate(chunks):
+    print(f"  [{i}] {chunk.page_content[:80]}... (长度={len(chunk.page_content)})")
+
+# chunk_overlap 的作用: 保证相邻两块之间有重叠内容
+# 例如: 块A = "苹果很好吃，香蕉也不"
+#       块B = "香蕉也不错，橘子更甜"
+# 重叠部分 = "香蕉也不"（出现在 A 和 B 中）
+# 目的: 防止关键信息刚好落在边界上被"腰斩"
+
+
+# ====== 2. CharacterTextSplitter: 按单个字符切分 ======
+splitter = CharacterTextSplitter(
+    separator="\n",     # 只按换行切
+    chunk_size=200,
+    chunk_overlap=40,
+)
+chunks = splitter.create_documents([sample_text])
+print(f"\nCharacterTextSplitter: {len(chunks)} 块")
+
+
+# ====== 3. TokenTextSplitter: 按 token 数切分 ======
+# 比按字符数更精确（因为 LLM 是按 token 计费的）
+splitter = TokenTextSplitter(
+    chunk_size=50,          # 每块 50 tokens
+    chunk_overlap=10,
+    encoding_name="cl100k_base",  # GPT-4 使用的编码
+)
+chunks = splitter.create_documents([sample_text])
+print(f"TokenTextSplitter: {len(chunks)} 块")
+
+
+# ====== 4. MarkdownHeaderTextSplitter: 按标题层级切分 ======
+# 适用场景: Markdown 文档，希望保持标题-内容的归属关系
+try:
+    splitter = MarkdownHeaderTextSplitter(
+        headers_to_split_on=[
+            ("#", "h1"),    # 一级标题
+            ("##", "h2"),   # 二级标题
+        ],
+        strip_headers=False,  # 是否在内容中去掉标题行本身
+    )
+    chunks = splitter.split_text(sample_text)
+    print(f"\nMarkdownHeaderTextSplitter: {len(chunks)} 块")
+    for chunk in chunks:
+        print(f"  [{chunk.metadata.get('h1', '')} > {chunk.metadata.get('h2', '')}] : "
+              f"{chunk.page_content[:60]}...")
+except Exception as e:
+    print(f"MarkdownHeaderTextSplitter 跳过: {e}")
+```
+
+**切分策略选择指南**：
+
+| 文档类型 | 推荐切分器 | chunk_size 建议 | overlap 建议 |
+|----------|-----------|----------------|-------------|
+| 纯文本/文章 | RecursiveCharacterTextSplitter | 500-1000 字符 | 100-200 |
+| 代码 | 按函数/类切分（Language Splitter） | 看函数长度 | 0（代码不需要重叠） |
+| Markdown 文档 | MarkdownHeaderTextSplitter | 按章节 | 0 |
+| 法律/合同（长段落） | RecursiveCharacterTextSplitter | 1000-2000 字符 | 200-300 |
+| FAQ/对话 | 按 Q&A 对切 | 一条 Q&A | 0 |
+
+#### Embedding 与 Vector Store
+
+```python
+"""
+ex_7_6_embedding_vectorstore.py: Embedding 与向量存储
+演示：文本向量化 + Chroma 向量库存储 + 相似度检索
+"""
+from langchain_openai import OpenAIEmbeddings
+from langchain_community.vectorstores import Chroma
+from langchain_text_splitters import RecursiveCharacterTextSplitter
+from langchain_community.document_loaders import TextLoader
+import os
+
+# ====== 1. 初始化 Embedding 模型 ======
+embeddings = OpenAIEmbeddings(
+    model="text-embedding-3-small",  # 性价比高（比 3-large 便宜 10 倍）
+    # model="text-embedding-3-large",  # 更准确但更贵
+    # dimensions=1024,  # 可降维（3-small 默认 1536，3-large 默认 3072）
+    # 降维可以减少向量存储大小，代价是检索精度轻微下降
+)
+
+# 快速测试：将单个文本转为向量
+sample_text = "Python 是一种高级编程语言"
+vector = embeddings.embed_query(sample_text)
+print(f"向量维度: {len(vector)}")
+print(f"向量前5个值: {vector[:5]}")
+# 每个 embedding 向量是一个高维空间中的点
+# 语义相近的文本在向量空间中距离也近
+
+
+# ====== 2. 加载文档并切分 ======
+# 假设有一批产品文档
+documents = [
+    "Python 是一种解释型语言，适合快速开发。语法简洁，拥有丰富的第三方库。",
+    "Java 是一种编译型语言，跨平台能力强。广泛应用于企业级开发。",
+    "JavaScript 主要用于 Web 前端开发，也可以在 Node.js 后端运行。",
+    "Docker 是一个容器化平台，可以让应用在隔离的环境中运行。",
+    "Kubernetes 是容器编排平台，管理大规模的 Docker 容器集群。",
+    "Redis 是一个内存数据库，常用于缓存、消息队列和会话管理。",
+]
+
+# 将文本转为 Document 对象列表
+from langchain_core.documents import Document
+docs = [Document(page_content=text) for text in documents]
+
+# 切分（本例文本较短，不做切分也可以，但实际项目应该切分）
+splitter = RecursiveCharacterTextSplitter(chunk_size=200, chunk_overlap=50)
+chunks = splitter.split_documents(docs)
+print(f"\n切分后: {len(chunks)} 块")
+
+
+# ====== 3. 存入 Chroma 向量库 ======
+# Chroma 是一个轻量级的向量数据库，数据保存在本地磁盘
+persist_dir = "./chroma_db"
+
+# 如果目录已存在，先清空（避免重复数据）
+import shutil
+if os.path.exists(persist_dir):
+    shutil.rmtree(persist_dir)
+
+vectorstore = Chroma.from_documents(
+    documents=chunks,
+    embedding=embeddings,
+    persist_directory=persist_dir,  # 持久化到磁盘
+    # collection_name="my_knowledge",  # 集合名（同一数据库可以有多个集合）
+)
+print(f"向量库已创建，保存到: {persist_dir}")
+
+# 下次启动时可以直接加载已有的向量库（不需要重新生成 embedding）
+# vectorstore = Chroma(
+#     persist_directory=persist_dir,
+#     embedding_function=embeddings,
+# )
+
+
+# ====== 4. 相似度检索 ======
+query = "哪种语言适合 Web 开发？"
+
+# 方式A: similarity_search 直接返回文档
+results = vectorstore.similarity_search(query, k=2)
+print(f"\n查询: {query}")
+print("检索结果:")
+for i, doc in enumerate(results):
+    print(f"  [{i}] {doc.page_content[:80]}...")
+
+# 方式B: similarity_search_with_score 返回文档 + 相似度分数
+# 分数越低 = 距离越近 = 越相似
+results_with_score = vectorstore.similarity_search_with_score(query, k=2)
+print("\n带分数的检索结果:")
+for i, (doc, score) in enumerate(results_with_score):
+    print(f"  [{i}] score={score:.4f} | {doc.page_content[:80]}...")
+
+# 方式C: similarity_search_by_vector 用已有向量检索
+# 适用场景: 自己先生成查询向量（可能经过某种变换），再搜
+query_vector = embeddings.embed_query(query)
+results = vectorstore.similarity_search_by_vector(query_vector, k=2)
+
+
+# ====== 5. 进阶: MMR (Maximal Marginal Relevance) 检索 ======
+# 普通检索只按相似度排序，可能导致 Top-K 结果内容雷同
+# MMR 在相似度和多样性之间做平衡
+results_mmr = vectorstore.max_marginal_relevance_search(
+    query,
+    k=3,            # 返回 3 个结果
+    fetch_k=10,     # 先从 Top-10 中选
+    lambda_mult=0.5, # 多样性权重: 0=完全多样, 1=完全相似
+)
+print("\nMMR 检索结果 (更注重多样性):")
+for i, doc in enumerate(results_mmr):
+    print(f"  [{i}] {doc.page_content[:80]}...")
+```
+
+#### Retriever（检索器）
+
+Retriever 是对上述流程的封装，提供统一的检索接口：
+
+```python
+"""
+ex_7_7_retrievers.py: LangChain Retriever 详解
+演示：各种 Retriever 的配置和使用
+"""
+from langchain_openai import OpenAIEmbeddings
+from langchain_community.vectorstores import Chroma
+from langchain_core.documents import Document
+
+# 准备向量库（继承自 7_6 的 chroma_db）
+embeddings = OpenAIEmbeddings(model="text-embedding-3-small")
+
+# 如果已有向量库则加载，否则新建
+import os
+if os.path.exists("./chroma_db"):
+    vectorstore = Chroma(
+        persist_directory="./chroma_db",
+        embedding_function=embeddings,
+    )
+else:
+    # 没有就跳过这个示例
+    print("请先运行 ex_7_6_embedding_vectorstore.py 创建向量库")
+    exit()
+
+
+# ====== 1. 基础 Retriever ======
+# 最简单的检索器: 给定 query，返回 k 个最相似文档
+retriever = vectorstore.as_retriever(
+    search_type="similarity",  # 相似度检索
+    search_kwargs={"k": 3},    # 返回前 3 个
+)
+docs = retriever.invoke("什么是 Python？")
+print("基础检索结果:")
+for doc in docs:
+    print(f"  - {doc.page_content[:60]}...")
+
+
+# ====== 2. MMR Retriever（多样性检索） ======
+retriever_mmr = vectorstore.as_retriever(
+    search_type="mmr",
+    search_kwargs={
+        "k": 3,
+        "fetch_k": 10,
+        "lambda_mult": 0.5,
+    },
+)
+docs = retriever_mmr.invoke("编程语言")
+print("\nMMR 检索结果:")
+for doc in docs:
+    print(f"  - {doc.page_content[:60]}...")
+
+
+# ====== 3. 相似度阈值过滤 ======
+# 只返回相似度高于某个阈值的结果
+retriever_threshold = vectorstore.as_retriever(
+    search_type="similarity_score_threshold",
+    search_kwargs={
+        "score_threshold": 0.3,  # 只返回 score > 0.3 的结果
+        "k": 5,
+    },
+)
+docs = retriever_threshold.invoke("容器化技术")
+print(f"\n阈值过滤检索: 返回 {len(docs)} 个结果")
+for doc in docs:
+    print(f"  - {doc.page_content[:60]}...")
+
+
+# ====== 4. 组合多个 Retriever ======
+# 从不同数据源分别检索，然后合并结果
+# 适用场景: 同时搜知识库 + 产品文档 + FAQ
+from langchain.retrievers import EnsembleRetriever
+
+# 创建两个带不同参数的检索器
+retriever1 = vectorstore.as_retriever(search_kwargs={"k": 3})
+retriever2 = vectorstore.as_retriever(
+    search_type="mmr", search_kwargs={"k": 3, "fetch_k": 10}
+)
+
+# 组合: 两个检索器各返回 3 个结果，去重后合并
+ensemble = EnsembleRetriever(
+    retrievers=[retriever1, retriever2],
+    weights=[0.7, 0.3],  # retriever1 权重 70%，retriever2 权重 30%
+)
+docs = ensemble.invoke("编程语言")
+print(f"\n组合检索: 返回 {len(docs)} 个结果")
+
+
+# ====== 5. Self-Query Retriever（自查询检索） ======
+# 从用户的自然语言问题中提取查询条件
+# 例如用户说 "搜索2024年发布的Python教程"，模型会提取:
+#   查询内容="Python教程", 过滤条件="year=2024"
+from langchain.retrievers.self_query.base import SelfQueryRetriever
+from langchain.chains.query_constructor.base import AttributeInfo
+
+# 定义文档的元数据字段
+metadata_field_info = [
+    AttributeInfo(
+        name="source",
+        description="文档来源文件",
+        type="string",
+    ),
+    AttributeInfo(
+        name="year",
+        description="文档发布年份",
+        type="integer",
+    ),
+]
+
+# 描述文档内容
+document_content_description = "技术教程和文档"
+
+# 理论上这样创建:
+# retriever = SelfQueryRetriever.from_llm(
+#     llm=ChatOpenAI(model="gpt-4o", temperature=0),
+#     vectorstore=vectorstore,
+#     document_contents=document_content_description,
+#     metadata_field_info=metadata_field_info,
+# )
+# docs = retriever.invoke("搜索2024年发布的关于Python的文档")
+```
+
+### 7.1.5 Chains（链）
+
+Chain 是 LangChain 的核心编排机制——将多个步骤串联成一条处理流水线。
+
+```python
+"""
+ex_7_8_chains.py: LangChain Chains 详解
+演示：LLMChain、SequentialChain、RouterChain
+"""
+from langchain_openai import ChatOpenAI
+from langchain_core.prompts import ChatPromptTemplate
+from langchain_core.output_parsers import StrOutputParser, JsonOutputParser
+
+llm = ChatOpenAI(model="gpt-4o", temperature=0.7)
+
+# ====== 1. 简单 Chain: Prompt + LLM + Parser ======
+# 这是最基本的链——三个步骤用管道连接
+prompt = ChatPromptTemplate.from_template(
+    "将以下内容翻译为{target_lang}: {text}"
+)
+chain = prompt | llm | StrOutputParser()
+
+result = chain.invoke({"target_lang": "英文", "text": "人工智能正在改变世界"})
+print(f"简单 Chain: {result}")
+
+
+# ====== 2. 复杂的 SequentialChain（多步串联） ======
+# 旧版 API 的 LLMChain 和 SequentialChain 已过时，
+# 新版推荐用 LCEL（下一节详细介绍）。
+# 这里先用 LCEL 展示多步流水线:
+
+# 步骤1: 提取关键词
+extract_prompt = ChatPromptTemplate.from_template(
+    "从以下文本中提取 3-5 个关键词，用逗号分隔: {text}"
+)
+extract_chain = extract_prompt | llm | StrOutputParser()
+
+# 步骤2: 根据关键词生成摘要
+summarize_prompt = ChatPromptTemplate.from_template(
+    "根据以下关键词创作一段简短摘要（100字以内）: {keywords}"
+)
+summarize_chain = summarize_prompt | llm | StrOutputParser()
+
+# 步骤3: 将摘要翻译为英文
+translate_prompt = ChatPromptTemplate.from_template(
+    "将以下中文翻译为英文: {summary}"
+)
+translate_chain = translate_prompt | llm | StrOutputParser()
+
+# 串联: 先提取关键词 → 再生成摘要 → 再翻译
+# 使用 RunnableLambda 做中间处理
+from langchain_core.runnables import RunnableLambda
+
+def extract_keywords_output(input_dict):
+    """提取关键词步骤"""
+    result = extract_chain.invoke({"text": input_dict["text"]})
+    return {"keywords": result, "text": input_dict["text"]}
+
+def summarize_output(input_dict):
+    """生成摘要步骤"""
+    result = summarize_chain.invoke({"keywords": input_dict["keywords"]})
+    return {"summary": result}
+
+def translate_output(input_dict):
+    """翻译步骤"""
+    result = translate_chain.invoke({"summary": input_dict["summary"]})
+    return {"translation": result, "summary": input_dict["summary"]}
+
+# 用 RunnableLambda 包装纯函数
+full_pipeline = (
+    RunnableLambda(extract_keywords_output)
+    | RunnableLambda(summarize_output)
+    | RunnableLambda(translate_output)
+)
+
+result = full_pipeline.invoke({
+    "text": "Python 是一门简洁高效的编程语言，在数据科学、人工智能和 Web 开发领域广泛应用。"
+})
+print(f"\n多步流水线结果:")
+print(f"  摘要: {result['summary']}")
+print(f"  翻译: {result['translation']}")
+
+
+# ====== 3. RouterChain（路由链） ======
+# 根据输入内容的不同，自动路由到不同的处理链
+# 适用场景: 客服系统根据问题类型分流
+
+# 定义路由模板
+router_prompt = ChatPromptTemplate.from_template(
+    """判断以下用户问题的类型，只回答一个词:
+- "technical" 如果问题是技术问题（代码、Bug、配置等）
+- "billing" 如果问题是账单/付款相关
+- "general" 如果是一般性问题
+
+用户问题: {question}
+
+类型: """
+)
+
+# 不同类型的处理链
+tech_chain = (
+    ChatPromptTemplate.from_template(
+        "你是一位技术支持工程师。请解决以下问题: {question}"
+    )
+    | llm
+    | StrOutputParser()
+)
+
+billing_chain = (
+    ChatPromptTemplate.from_template(
+        "你是客服部门的账单专员。请处理以下账单问题: {question}"
+    )
+    | llm
+    | StrOutputParser()
+)
+
+general_chain = (
+    ChatPromptTemplate.from_template(
+        "你是一位友好的客服人员。请回答: {question}"
+    )
+    | llm
+    | StrOutputParser()
+)
+
+
+def route(info):
+    """根据分类结果路由到不同的链"""
+    question = info["question"]
+
+    # 先分类
+    category = (router_prompt | llm | StrOutputParser()).invoke({"question": question})
+    category = category.strip().lower()
+    print(f"  路由到: {category}")
+
+    # 再路由
+    if "billing" in category:
+        return billing_chain.invoke({"question": question})
+    elif "technical" in category:
+        return tech_chain.invoke({"question": question})
+    else:
+        return general_chain.invoke({"question": question})
+
+
+# 包装为 Runnable
+router_chain = RunnableLambda(route)
+
+questions = [
+    "我的代码报错 'NameError: name x is not defined'，怎么解决？",
+    "为什么这个月扣了我两次费用？",
+    "你们的营业时间是几点？",
+]
+
+print("\n=== 路由链测试 ===")
+for q in questions:
+    print(f"\n问题: {q}")
+    answer = router_chain.invoke({"question": q})
+    print(f"回复: {answer[:100]}...")
+```
+
+### 7.1.6 Agents（智能体）
+
+Agent 是 LangChain 中最强大的概念——让 LLM 自主决定使用哪些工具、以什么顺序使用工具来完成任务。
+
+```python
+"""
+ex_7_9_agent.py: LangChain Agent 详解
+演示：创建带工具的 Agent，LLM 自主决定调用哪些工具
+"""
+
+# 注意：LangChain 的 Agent API 在不同版本间变化很大。
+# 以下代码基于 langchain >= 0.3.0, langchain-openai >= 0.3.0
+
+from langchain_openai import ChatOpenAI
+from langchain_core.tools import tool
+from langchain.agents import AgentExecutor, create_tool_calling_agent
+from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
+import math
+import datetime
+
+llm = ChatOpenAI(model="gpt-4o", temperature=0)
+
+# ====== 1. 定义工具（Tools） ======
+# 工具就是 LLM 可以调用的函数，用 @tool 装饰器声明
+# 函数的 docstring 会作为工具的描述发给模型
+
+@tool
+def calculator(expression: str) -> str:
+    """计算数学表达式。支持加减乘除、幂运算、三角函数等。
+    参数: expression - 数学表达式字符串，如 "2+3*4" 或 "sqrt(16)" """
+    try:
+        # 安全地计算表达式
+        # 注意: eval 有安全风险，生产环境应用更安全的方案
+        allowed_names = {
+            "sqrt": math.sqrt, "sin": math.sin, "cos": math.cos,
+            "tan": math.tan, "log": math.log, "log10": math.log10,
+            "pi": math.pi, "e": math.e, "abs": abs, "pow": pow,
+            "round": round, "int": int, "float": float,
+        }
+        result = eval(expression, {"__builtins__": {}}, allowed_names)
+        return f"计算结果: {result}"
+    except Exception as e:
+        return f"计算出错: {e}"
+
+
+@tool
+def get_current_time(format: str = "%Y-%m-%d %H:%M:%S") -> str:
+    """获取当前日期和时间。
+    参数: format - 时间格式字符串（可选），默认 "%Y-%m-%d %H:%M:%S" """
+    return datetime.datetime.now().strftime(format)
+
+
+@tool
+def search_knowledge_base(query: str) -> str:
+    """在知识库中搜索技术文档。
+    参数: query - 搜索关键词或问题
+    返回: 相关的文档片段"""
+    # 模拟知识库（实际项目中接入向量库）
+    knowledge = {
+        "python": "Python 是一种解释型、面向对象的高级编程语言，由 Guido van Rossum 创建。",
+        "docker": "Docker 使用容器技术打包应用及其依赖，实现环境一致性。",
+        "git": "Git 是一个分布式版本控制系统，用于跟踪代码变更。",
+    }
+    query_lower = query.lower()
+    for key, value in knowledge.items():
+        if key in query_lower:
+            return value
+    return "未找到相关信息。"
+
+
+@tool
+def send_email(to: str, subject: str, body: str) -> str:
+    """发送电子邮件（模拟）。
+    参数:
+        to - 收件人邮箱地址
+        subject - 邮件主题
+        body - 邮件正文"""
+    # 模拟发送（实际项目接入 SMTP）
+    return f"邮件已发送给 {to}\n主题: {subject}\n正文: {body[:50]}..."
+
+
+# ====== 2. 创建 Agent ======
+# 将工具列表注册给 Agent
+tools = [calculator, get_current_time, search_knowledge_base, send_email]
+
+# Agent 的系统提示
+system_prompt = """你是一个有用的 AI 助手。你可以使用提供的工具来帮助用户。
+
+使用工具时:
+1. 先理解用户的真实需求
+2. 选择合适的工具
+3. 如果一个问题需要多个工具，按合理顺序调用
+4. 用中文回复用户
+5. 如果工具返回错误，向用户解释并尝试其他方法
+
+当前时间: {current_time}
+"""
+
+prompt = ChatPromptTemplate.from_messages([
+    ("system", system_prompt),
+    MessagesPlaceholder(variable_name="chat_history", optional=True),
+    ("human", "{input}"),
+    MessagesPlaceholder(variable_name="agent_scratchpad"),  # Agent 思考过程
+])
+
+# 创建 Agent
+agent = create_tool_calling_agent(llm, tools, prompt)
+
+# 创建 AgentExecutor（负责 Agent 的循环调用和错误处理）
+agent_executor = AgentExecutor(
+    agent=agent,
+    tools=tools,
+    verbose=True,         # 打印思考过程
+    handle_parsing_errors=True,  # 处理输出解析错误
+    max_iterations=10,    # 最大工具调用次数（防止死循环）
+    # max_execution_time=30,  # 最大执行时间（秒）
+)
+
+# ====== 3. 测试 Agent ======
+# Agent 的思考→行动→观察→思考... 循环
+# 流程:
+#   1. Agent 收到问题
+#   2. Thought: 我该用什么工具？
+#   3. Action: 调用某个工具
+#   4. Observation: 工具返回结果
+#   5. Thought: 结果够了吗？还需要更多信息吗？
+#   6. 如果够了 → Final Answer; 不够 → 回到步骤 2
+
+test_queries = [
+    "现在几点了？",
+    "帮我算一下 123 * 456 + 789",
+    "告诉我 Python 是什么，然后用中文发一封邮件给 admin@example.com",
+    "查一下 Docker 是什么，然后告诉我现在的时间",
+]
+
+for query in test_queries:
+    print(f"\n{'='*60}")
+    print(f"用户: {query}")
+    result = agent_executor.invoke({
+        "input": query,
+        "current_time": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+    })
+    print(f"Agent: {result['output']}")
+
+# ====== 4. 带对话历史的 Agent ======
+# Agent 也能记住之前的对话（通过 chat_history）
+
+from langchain_core.messages import HumanMessage, AIMessage
+
+chat_history = []
+
+print(f"\n=== 多轮对话 Agent ===")
+questions = [
+    "现在几点了？",
+    "刚才你说是几点？",  # 依赖上一轮的上下文
+]
+
+for q in questions:
+    print(f"\n用户: {q}")
+    result = agent_executor.invoke({
+        "input": q,
+        "chat_history": chat_history,
+        "current_time": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+    })
+    print(f"Agent: {result['output']}")
+
+    # 更新对话历史
+    chat_history.append(HumanMessage(content=q))
+    chat_history.append(AIMessage(content=result['output']))
+```
+
+---
+
+## 7.2 LCEL（LangChain Expression Language）
+
+LCEL 是 LangChain 推荐的现代 API，使用管道操作符 `|` 组合 Runnable 对象。
+
+### 7.2.1 管道语法与 Runnable 接口
+
+```python
+"""
+ex_7_10_lcel_basics.py: LCEL 管道语法基础
+演示：Runnable 接口的 invoke/batch/stream/invoke_async
+"""
+import time
+from langchain_openai import ChatOpenAI
+from langchain_core.prompts import ChatPromptTemplate
+from langchain_core.output_parsers import StrOutputParser
+from langchain_core.runnables import RunnablePassthrough, RunnableLambda, RunnableParallel
+
+llm = ChatOpenAI(model="gpt-4o-mini", temperature=0)
+
+# ====== 1. 管道语法基础 ======
+# | 操作符: a | b 表示 a 的输出作为 b 的输入
+
+# 最简单的链: prompt → llm → parser
+prompt = ChatPromptTemplate.from_template("给我讲一个关于{topic}的笑话")
+chain = prompt | llm | StrOutputParser()
+
+# 所有 Runnable 对象都实现了统一的接口
+# Runnable 接口方法:
+#   invoke(input)       → 同步执行，返回结果
+#   batch(inputs)       → 批量执行
+#   stream(input)       → 流式输出
+#   ainvoke(input)      → 异步 invoke
+#   abatch(inputs)      → 异步 batch
+#   astream(input)      → 异步 stream
+
+# === invoke ===
+result = chain.invoke({"topic": "程序员"})
+print(f"invoke: {result[:50]}...")
+
+# === batch: 批量处理 ===
+# 批量比逐个调用更快（内部可能并行）
+results = chain.batch([
+    {"topic": "程序员"},
+    {"topic": "厨师"},
+    {"topic": "医生"},
+])
+for i, r in enumerate(results):
+    print(f"batch[{i}]: {r[:50]}...")
+
+
+# ====== 2. RunnablePassthrough: 透传 ======
+# 在某些链中，你需要把前面的输出原封不动地传给后面
+
+# 场景：先给文本翻译，但需要保留原文做对比
+translate_chain = (
+    ChatPromptTemplate.from_template("将以下内容翻译为英文: {text}")
+    | llm
+    | StrOutputParser()
+)
+
+# 使用 RunnablePassthrough 保留原始输入
+combined_chain = RunnableParallel(
+    original=RunnablePassthrough(),
+    translated=translate_chain,
+)
+
+result = combined_chain.invoke({"text": "人工智能正在改变世界"})
+print(f"\n原始: {result['original']}")
+print(f"翻译: {result['translated']}")
+
+
+# ====== 3. RunnableLambda: 插入自定义函数 ======
+# 在链的任意位置插入一个普通 Python 函数
+
+def count_chars(text: str) -> str:
+    """统计字符数"""
+    return f"{text}\n\n(以上共 {len(text)} 个字符)"
+
+def add_timestamp(text: str) -> str:
+    """添加时间戳"""
+    ts = time.strftime("%Y-%m-%d %H:%M:%S")
+    return f"[{ts}]\n{text}"
+
+# 在 LLM 输出后插入自定义函数
+chain_with_fn = (
+    prompt | llm | StrOutputParser()
+    | RunnableLambda(count_chars)      # 统计字符
+    | RunnableLambda(add_timestamp)    # 加时间戳
+)
+
+result = chain_with_fn.invoke({"topic": "Python"})
+print(f"\n带函数处理:\n{result}")
+
+
+# ====== 4. RunnableParallel: 并行执行 ======
+# 同时执行多个子链，合并结果
+
+# 场景：对同一段文本同时做翻译、摘要、关键词提取
+text = "Artificial intelligence has revolutionized how we interact with technology. "
+
+translate = (
+    ChatPromptTemplate.from_template("翻译为中文: {text}")
+    | llm | StrOutputParser()
+)
+summarize = (
+    ChatPromptTemplate.from_template("用一句话总结: {text}")
+    | llm | StrOutputParser()
+)
+keywords = (
+    ChatPromptTemplate.from_template("提取3个关键词，逗号分隔: {text}")
+    | llm | StrOutputParser()
+)
+
+# 三个分支并行执行
+parallel_chain = RunnableParallel(
+    translation=translate,
+    summary=summarize,
+    keywords=keywords,
+)
+
+result = parallel_chain.invoke({"text": text})
+print(f"\n并行处理结果:")
+print(f"  翻译: {result['translation']}")
+print(f"  摘要: {result['summary']}")
+print(f"  关键词: {result['keywords']}")
+
+
+# ====== 5. stream: 流式输出 ======
+# 逐 token 输出，适合聊天场景
+print("\n=== 流式输出 ===")
+for chunk in chain.stream({"topic": "人工智能"}):
+    print(chunk, end="", flush=True)
+print()
+```
+
+### 7.2.2 LCEL 构建 RAG Chain
+
+```python
+"""
+ex_7_11_lcel_rag.py: 用 LCEL 构建完整的 RAG Chain
+演示：文档加载→切分→向量化→检索→生成答案 的完整流水线
+"""
+from langchain_openai import ChatOpenAI, OpenAIEmbeddings
+from langchain_community.vectorstores import Chroma
+from langchain_text_splitters import RecursiveCharacterTextSplitter
+from langchain_core.prompts import ChatPromptTemplate
+from langchain_core.output_parsers import StrOutputParser
+from langchain_core.runnables import RunnablePassthrough, RunnableLambda
+from langchain_core.documents import Document
+
+
+def build_rag_chain(
+    documents: list[str],
+    model_name: str = "gpt-4o-mini",
+) -> object:
+    """
+    构建一个完整的 RAG 链。
+
+    参数:
+        documents: 文档字符串列表
+        model_name: LLM 模型名
+
+    返回:
+        一个可调用的 RAG chain（invoke 传入 {"question": "..."} 即可）
+
+    RAG 的数据流:
+        question
+          ├─→ retriever → context（检索到的相关文档）
+          └─→ question（原始问题，通过 RunnablePassthrough 透传）
+               ↓
+        prompt.format(question, context)
+               ↓
+        llm.invoke(formatted_prompt)
+               ↓
+        StrOutputParser.parse(llm_output)
+               ↓
+        answer
+    """
+    # 步骤1: 创建 Document 对象
+    docs = [Document(page_content=text) for text in documents]
+
+    # 步骤2: 切分文本
+    splitter = RecursiveCharacterTextSplitter(
+        chunk_size=300,
+        chunk_overlap=50,
+    )
+    chunks = splitter.split_documents(docs)
+    print(f"文档切分为 {len(chunks)} 块")
+
+    # 步骤3: 创建向量库和检索器
+    embeddings = OpenAIEmbeddings(model="text-embedding-3-small")
+    vectorstore = Chroma.from_documents(
+        documents=chunks,
+        embedding=embeddings,
+        # 使用内存模式（不持久化），适合演示
+        # 生产环境应设置 persist_directory
+    )
+    retriever = vectorstore.as_retriever(
+        search_type="similarity",
+        search_kwargs={"k": 3},  # 取 Top-3 相关片段
+    )
+
+    # 步骤4: 定义 Prompt 模板
+    # 这个模板把检索到的上下文和用户问题组合在一起
+    template = """你是一位知识丰富的助手。请根据以下参考资料回答用户问题。
+
+参考资料:
+{context}
+
+用户问题: {question}
+
+回答要求:
+1. 优先使用参考资料中的信息
+2. 如果参考资料不够，可以结合你的知识补充，但要明确说明
+3. 用中文回答，语言简洁清晰
+4. 如果无法回答，直接说"根据现有资料，我无法回答这个问题。"
+
+回答: """
+
+    prompt = ChatPromptTemplate.from_template(template)
+
+    # 步骤5: 构建 RAG Chain
+    llm = ChatOpenAI(model=model_name, temperature=0.3)
+
+    # 关键: 定义一个函数将检索到的文档拼接成上下文字符串
+    def format_docs(docs: list[Document]) -> str:
+        """将检索到的文档列表拼接为一段上下文字符串"""
+        return "\n\n---\n\n".join(
+            f"[来源 {i+1}]\n{doc.page_content}"
+            for i, doc in enumerate(docs)
+        )
+
+    # 构建链:
+    # {
+    #   context: retriever → format_docs    (检索 + 格式化)
+    #   question: RunnablePassthrough()     (透传原始问题)
+    # }
+    # → prompt → llm → StrOutputParser
+    rag_chain = (
+        {
+            "context": retriever | format_docs,
+            "question": RunnablePassthrough(),
+        }
+        | prompt
+        | llm
+        | StrOutputParser()
+    )
+
+    return rag_chain
+
+
+# ====== 测试 RAG Chain ======
+if __name__ == "__main__":
+    # 准备知识库文档
+    knowledge_base = [
+        """Python 是一种解释型、面向对象的高级编程语言。
+        Python 的设计哲学强调代码的可读性和简洁的语法。
+        它支持多种编程范式，包括面向对象、命令式、函数式和过程式编程。
+        Python 拥有一个庞大的标准库，被称为"自带电池(Batteries Included)"。""",
+
+        """Docker 是一个开源的应用容器引擎，让开发者可以打包他们的应用以及依赖包
+        到一个可移植的容器中，然后发布到任何流行的 Linux 机器上。
+        容器是完全沙箱机制，相互之间不会有任何接口。
+        Docker 使用客户端-服务器架构，Docker 守护进程负责构建、运行和分发容器。""",
+
+        """Git 是 Linus Torvalds 开发的分布式版本控制系统。
+        与 CVS、Subversion 等集中式版本控制系统不同，Git 每个工作目录
+        都是一个完整的仓库，包含完整的版本历史。
+        Git 的核心概念包括: 工作区、暂存区、本地仓库、远程仓库。""",
+
+        """RESTful API 是一种符合 REST (Representational State Transfer)
+        架构风格的 Web API 设计规范。它使用 HTTP 方法(GET, POST, PUT, DELETE)
+        来操作资源，资源通过 URL 来标识。RESTful API 是无状态的，
+        每个请求都包含完整的信息。""",
+    ]
+
+    # 构建 RAG 链
+    rag = build_rag_chain(knowledge_base)
+
+    # 测试查询
+    questions = [
+        "Python 的设计哲学是什么？",
+        "Docker 和 Git 有什么区别？",
+        "什么是无状态？",
+    ]
+
+    print("\n" + "=" * 60)
+    for q in questions:
+        print(f"\n问题: {q}")
+        answer = rag.invoke(q)  # 注意: 直接传字符串，不是 dict
+        print(f"回答: {answer}")
+        print("-" * 40)
+```
+
+### 7.2.3 LCEL vs 旧 Chain API
+
+| 特性 | 旧 Chain API (LLMChain 等) | LCEL |
+|------|---------------------------|------|
+| 语法 | 面向对象，需继承类 | 函数式，管道操作符 `\|` |
+| 组合 | 嵌套复杂 | 直观的线性管道 |
+| 并行 | 需手动管理 | `RunnableParallel` 一行搞定 |
+| 流式 | 部分支持 | 原生 `stream()` 支持 |
+| 异步 | 部分支持 | 原生 `ainvoke()/astream()` |
+| 调试 | 困难 | 每个步骤可以单独 debug |
+| 类型 | 弱类型 | 运行时可检查输入输出 schema |
+| 推荐度 | **已过时，不推荐新项目使用** | **官方推荐，稳定 API** |
+
+---
+
+## 7.3 LlamaIndex 核心架构
+
+### 7.3.1 什么是 LlamaIndex
+
+LlamaIndex（前身 GPT Index）是一个**数据索引框架**，专注于让 LLM 高效地与外部数据交互。它的核心设计理念是：
+
+```
+数据 → 索引 → 查询引擎 → 自然语言回答
+```
+
+与 LangChain 的区别：
+- **LangChain**：通用 LLM 应用框架，像一个"瑞士军刀"，什么都能做
+- **LlamaIndex**：专注于数据索引和检索，像一个"精品图书馆管理系统"
+
+```bash
+pip install llama-index llama-index-llms-openai llama-index-embeddings-openai
+```
+
+### 7.3.2 LlamaIndex 核心概念
+
+```python
+"""
+ex_7_12_llamaindex_basics.py: LlamaIndex 基础入门
+演示：从文档到索引到查询的完整流程
+"""
+from llama_index.core import (
+    VectorStoreIndex,
+    SimpleDirectoryReader,
+    Settings,
+    StorageContext,
+    load_index_from_storage,
+)
+from llama_index.llms.openai import OpenAI
+from llama_index.embeddings.openai import OpenAIEmbedding
+from llama_index.core import Document
+
+# ====== 1. 全局配置 ======
+# LlamaIndex 使用全局 Settings 对象管理默认配置
+Settings.llm = OpenAI(model="gpt-4o-mini", temperature=0)
+Settings.embed_model = OpenAIEmbedding(model="text-embedding-3-small")
+# Settings.chunk_size = 512       # 默认切分大小
+# Settings.chunk_overlap = 100    # 默认重叠大小
+
+# ====== 2. 创建 Document 对象 ======
+# LlamaIndex 的 Document 与 LangChain 的 Document 类似
+documents = [
+    Document(
+        text="Python 是一种解释型、面向对象的高级编程语言，由 Guido van Rossum 创建。"
+             "Python 的设计哲学强调代码可读性，使用缩进来定义代码块。",
+        metadata={"source": "python_intro", "category": "programming"},
+    ),
+    Document(
+        text="Docker 是一个容器化平台，允许将应用和依赖打包在一起。"
+             "容器是轻量级的、可移植的，可以在任何支持 Docker 的平台上运行。",
+        metadata={"source": "docker_intro", "category": "devops"},
+    ),
+    Document(
+        text="机器学习是人工智能的一个分支，让计算机从数据中学习模式。"
+             "常见的算法包括线性回归、决策树、支持向量机和神经网络。",
+        metadata={"source": "ml_intro", "category": "ai"},
+    ),
+    Document(
+        text="FastAPI 是一个现代、快速的 Python Web 框架，用于构建 API。"
+             "它基于 Python 类型提示，支持自动生成 OpenAPI 文档。",
+        metadata={"source": "fastapi_intro", "category": "web"},
+    ),
+]
+
+# ====== 3. 创建索引 ======
+# VectorStoreIndex 是 LlamaIndex 最常用的索引类型
+# 内部流程: 切分文档 → 生成 embedding → 存储到向量库
+index = VectorStoreIndex.from_documents(
+    documents,
+    show_progress=True,  # 显示处理进度
+)
+print(f"索引创建完成，包含 {len(documents)} 篇文档")
+
+# ====== 4. 保存和加载索引 ======
+# 持久化到磁盘（避免每次重新生成昂贵的 embedding）
+index.storage_context.persist(persist_dir="./llama_index_storage")
+print("索引已保存到 ./llama_index_storage")
+
+# 下次加载:
+# storage_context = StorageContext.from_defaults(
+#     persist_dir="./llama_index_storage"
+# )
+# index = load_index_from_storage(storage_context)
+
+
+# ====== 5. 查询索引 ======
+# 创建查询引擎
+query_engine = index.as_query_engine(
+    similarity_top_k=2,  # 检索 Top-2 相关片段
+    # response_mode="compact",  # 将检索到的片段压缩后给 LLM
+    # streaming=False,
+)
+
+# 执行查询
+questions = [
+    "Python 的设计哲学是什么？",
+    "Docker 有什么优点？",
+    "机器学习有哪些常见算法？",
+]
+
+print("\n=== 查询结果 ===")
+for q in questions:
+    response = query_engine.query(q)
+    print(f"\nQ: {q}")
+    print(f"A: {response}")
+    # response 对象包含更多信息:
+    # print(f"  来源节点: {response.source_nodes}")
+    # print(f"  元数据: {response.metadata}")
+```
+
+### 7.3.3 数据连接器（Data Connectors）
+
+```python
+"""
+ex_7_13_llamaindex_connectors.py: LlamaIndex 数据连接器
+演示：从各种数据源加载数据
+"""
+from llama_index.core import SimpleDirectoryReader, Document
+
+# ====== 1. SimpleDirectoryReader：加载目录中的文件 ======
+# 自动检测文件类型并选择合适的解析器
+try:
+    reader = SimpleDirectoryReader(
+        input_dir="./data/",           # 源目录
+        recursive=True,               # 递归子目录
+        required_exts=[".txt", ".md"],  # 只加载特定扩展名
+        # exclude_hidden=True,        # 排除隐藏文件
+        # encoding="utf-8",           # 文件编码
+    )
+    documents = reader.load_data()
+    print(f"从目录加载了 {len(documents)} 个文档")
+    for doc in documents[:3]:
+        print(f"  源: {doc.metadata.get('file_name', 'unknown')}, "
+              f"长度: {len(doc.text)} 字符")
+except Exception as e:
+    print(f"目录加载跳过: {e}")
+
+
+# ====== 2. 从各种数据源加载 ======
+# LlamaIndex 提供了丰富的 Connector（需要额外安装依赖）
+
+# PDF: pip install llama-index-readers-file
+# from llama_index.readers.file import PDFReader
+# reader = PDFReader()
+# docs = reader.load_data("report.pdf")
+
+# 网页: pip install llama-index-readers-web
+# from llama_index.readers.web import SimpleWebPageReader
+# reader = SimpleWebPageReader()
+# docs = reader.load_data(["https://example.com/page1", "https://example.com/page2"])
+
+# 数据库: pip install llama-index-readers-database
+# from llama_index.readers.database import DatabaseReader
+# reader = DatabaseReader(
+#     scheme="postgresql",
+#     host="localhost",
+#     ...
+# )
+# docs = reader.load_data("SELECT * FROM articles")
+
+# Notion: pip install llama-index-readers-notion
+# from llama_index.readers.notion import NotionPageReader
+# reader = NotionPageReader(integration_token="...")
+# docs = reader.load_data(page_ids=["page_id_1", "page_id_2"])
+
+# GitHub: pip install llama-index-readers-github
+# from llama_index.readers.github import GithubRepositoryReader
+# reader = GithubRepositoryReader(github_token="...", owner="...", repo="...")
+# docs = reader.load_data()
+
+
+# ====== 3. 手动创建 Document ======
+# 也可以直接编程式创建文档
+custom_docs = [
+    Document(
+        text="这是一篇手动创建的技术文档，内容是关于...",
+        metadata={
+            "title": "技术文档1",
+            "author": "张三",
+            "created_at": "2025-01-15",
+            "tags": ["python", "tutorial"],
+        },
+        # metadata 中的字段可以用于后续的元数据过滤
+        # excluded_llm_metadata_keys=["author"],  # 某些字段不发给 LLM
+        # excluded_embed_metadata_keys=["created_at"],  # 某些字段不参与 embedding
+    )
+]
+print(f"\n手动创建了 {len(custom_docs)} 个文档")
+```
+
+### 7.3.4 索引类型
+
+```python
+"""
+ex_7_14_llamaindex_index_types.py: LlamaIndex 索引类型对比
+演示：VectorStoreIndex、SummaryIndex、TreeIndex 的使用场景
+"""
+from llama_index.core import (
+    VectorStoreIndex,
+    SummaryIndex,
+    TreeIndex,
+    KeywordTableIndex,
+    Settings,
+    Document,
+)
+from llama_index.llms.openai import OpenAI
+from llama_index.embeddings.openai import OpenAIEmbedding
+
+Settings.llm = OpenAI(model="gpt-4o-mini", temperature=0)
+Settings.embed_model = OpenAIEmbedding(model="text-embedding-3-small")
+
+# 准备文档
+documents = [
+    Document(text=f"这是第{i}篇文档，内容是关于主题{i}的详细信息。" * 3)
+    for i in range(20)
+]
+
+# ====== 1. VectorStoreIndex（向量索引）【最常用】 ======
+# 原理: 将文档切片转为向量，查询时做相似度检索 + LLM 合成
+# 适用: 大部分场景，尤其是语义搜索
+index_vec = VectorStoreIndex.from_documents(documents)
+query_engine = index_vec.as_query_engine(similarity_top_k=2)
+result = query_engine.query("关于主题5的信息")
+print(f"VectorStoreIndex: {result}")
+
+
+# ====== 2. SummaryIndex（摘要索引） ======
+# 原理: 将每个文档生成摘要，查询时基于摘要做匹配
+# 适用: 需要对大段内容做概括的场景
+index_sum = SummaryIndex.from_documents(documents)
+query_engine = index_sum.as_query_engine(
+    response_mode="tree_summarize",  # 递归摘要模式
+)
+result = query_engine.query("总结所有文档的主要内容")
+print(f"\nSummaryIndex: {result}")
+
+
+# ====== 3. TreeIndex（树索引） ======
+# 原理: 自底向上构建一棵总结树，每个父节点是子节点的摘要
+# 适用: 需要回答总结性/概括性问题的场景
+# 注意: TreeIndex 构建较慢（需要多次 LLM 调用生成摘要）
+# index_tree = TreeIndex.from_documents(documents)
+# query_engine = index_tree.as_query_engine()
+# result = query_engine.query("总结这些文档的核心观点")
+
+# ====== 4. KeywordTableIndex（关键词表索引） ======
+# 原理: 为每个文档提取关键词，建立关键词→文档的映射
+# 适用: 关键词匹配精确度要求高的场景
+# index_kw = KeywordTableIndex.from_documents(documents)
+# query_engine = index_kw.as_query_engine()
+# result = query_engine.query("主题5")
+```
+
+**索引选择指南**：
+
+| 索引类型 | 适用场景 | 构建速度 | 查询质量 | 成本 |
+|----------|---------|---------|---------|------|
+| VectorStoreIndex | 通用语义搜索（推荐首选） | 快 | 高 | 低 |
+| SummaryIndex | 长文档摘要 | 中 | 中-高 | 中 |
+| TreeIndex | 总结性问答 | 慢 | 高（总结） | 高 |
+| KeywordTableIndex | 精确关键词匹配 | 快 | 中（关键词） | 低 |
+| KnowledgeGraphIndex | 实体关系查询 | 慢 | 高（关系） | 高 |
+
+### 7.3.5 查询引擎（Query Engine）
+
+```python
+"""
+ex_7_15_llamaindex_query_engine.py: LlamaIndex 查询引擎高级用法
+演示：自定义 Prompt、子问题查询、元数据过滤
+"""
+from llama_index.core import VectorStoreIndex, Document, Settings
+from llama_index.llms.openai import OpenAI
+from llama_index.embeddings.openai import OpenAIEmbedding
+
+Settings.llm = OpenAI(model="gpt-4o-mini", temperature=0)
+Settings.embed_model = OpenAIEmbedding(model="text-embedding-3-small")
+
+# 准备带丰富元数据的文档
+documents = [
+    Document(
+        text="Python 3.12 引入了新的 f-string 语法，支持在表达式内使用双引号。"
+             "性能方面，Python 3.12 比 3.11 提升了约 5%。",
+        metadata={"version": "3.12", "year": 2024, "topic": "python"},
+    ),
+    Document(
+        text="Python 3.11 的主要改进是错误消息更加友好，能够精确定位错误位置。"
+             "此外还引入了 ExceptionGroup 和 except* 语法。",
+        metadata={"version": "3.11", "year": 2023, "topic": "python"},
+    ),
+    Document(
+        text="FastAPI 使用 Pydantic v2 进行数据校验，支持异步路由处理。"
+             "它的性能与 Node.js 和 Go 框架相当。",
+        metadata={"version": "0.100", "year": 2024, "topic": "fastapi"},
+    ),
+    Document(
+        text="Docker Compose v2 使用 'docker compose' 命令（无连字符）。"
+             "它支持 GPU 设备映射和服务配置文件。",
+        metadata={"version": "v2", "year": 2023, "topic": "docker"},
+    ),
+]
+
+index = VectorStoreIndex.from_documents(documents)
+
+
+# ====== 1. 元数据过滤 ======
+# 只在与 year=2024 的文档中搜索
+from llama_index.core.vector_stores import MetadataFilters, MetadataFilter
+
+query_engine = index.as_query_engine(
+    similarity_top_k=3,
+    filters=MetadataFilters(
+        filters=[
+            MetadataFilter(key="year", value=2024),
+        ],
+        condition="and",  # 所有条件都满足
+    ),
+)
+
+result = query_engine.query("有哪些新特性？")
+print(f"元数据过滤 (year=2024): {result}")
+
+
+# ====== 2. 自定义 Prompt 模板 ======
+from llama_index.core.prompts import PromptTemplate
+
+# 自定义 QA Prompt
+qa_prompt = PromptTemplate(
+    "你是一位技术文档助手。根据以下信息回答问题。\n"
+    "参考资料:\n"
+    "{context_str}\n"
+    "问题: {query_str}\n"
+    "请用中文回答，以'根据文档记载，'开头。"
+    "如果文档中没有相关信息，说'文档中未找到相关信息'。\n"
+    "回答: "
+)
+
+query_engine = index.as_query_engine(
+    text_qa_template=qa_prompt,
+    similarity_top_k=3,
+)
+
+result = query_engine.query("Python 3.12 有什么新特性？")
+print(f"\n自定义 Prompt: {result}")
+
+
+# ====== 3. 子问题查询（SubQuestionQueryEngine） ======
+# 将复杂问题拆解为多个子问题，分别查询后汇总
+from llama_index.core.tools import QueryEngineTool, ToolMetadata
+from llama_index.core.query_engine import SubQuestionQueryEngine
+
+# 为不同 topic 创建不同的查询引擎
+python_index = VectorStoreIndex.from_documents(
+    [d for d in documents if d.metadata["topic"] == "python"]
+)
+fastapi_index = VectorStoreIndex.from_documents(
+    [d for d in documents if d.metadata["topic"] == "fastapi"]
+)
+docker_index = VectorStoreIndex.from_documents(
+    [d for d in documents if d.metadata["topic"] == "docker"]
+)
+
+# 为每个索引创建查询工具
+python_tool = QueryEngineTool(
+    query_engine=python_index.as_query_engine(),
+    metadata=ToolMetadata(
+        name="python_docs",
+        description="Python 编程语言的版本更新和新特性文档",
+    ),
+)
+fastapi_tool = QueryEngineTool(
+    query_engine=fastapi_index.as_query_engine(),
+    metadata=ToolMetadata(
+        name="fastapi_docs",
+        description="FastAPI Web 框架文档",
+    ),
+)
+docker_tool = QueryEngineTool(
+    query_engine=docker_index.as_query_engine(),
+    metadata=ToolMetadata(
+        name="docker_docs",
+        description="Docker 容器技术的文档",
+    ),
+)
+
+# 创建子问题查询引擎
+sq_engine = SubQuestionQueryEngine.from_defaults(
+    query_engine_tools=[python_tool, fastapi_tool, docker_tool],
+    llm=Settings.llm,
+)
+
+# 这个引擎会自动把问题拆解为子问题，分别查不同索引，最后汇总
+result = sq_engine.query("Python 3.12 和 FastAPI 最近有什么更新？")
+print(f"\n子问题查询: {result}")
+```
+
+### 7.3.6 Chat Engine（对话引擎）
+
+```python
+"""
+ex_7_16_llamaindex_chat_engine.py: LlamaIndex Chat Engine
+演示：带记忆的多轮对话式查询
+"""
+from llama_index.core import VectorStoreIndex, Document, Settings
+from llama_index.llms.openai import OpenAI
+from llama_index.embeddings.openai import OpenAIEmbedding
+from llama_index.core.memory import ChatMemoryBuffer
+
+Settings.llm = OpenAI(model="gpt-4o-mini", temperature=0)
+Settings.embed_model = OpenAIEmbedding(model="text-embedding-3-small")
+
+# 准备文档
+documents = [
+    Document(text="公司2025年第一季度的收入为 1500 万元，同比增长 20%。"),
+    Document(text="公司2025年第二季度的收入为 1800 万元，环比增长 20%。"),
+    Document(text="公司员工总数为 500 人，其中研发人员占 60%。"),
+    Document(text="公司总部位于北京，在上海、深圳设有分公司。"),
+]
+
+index = VectorStoreIndex.from_documents(documents)
+
+# ====== 1. 创建 Chat Engine（有记忆的对话） ======
+# 三种模式:
+#   "condense_question": 将对话历史 + 新问题浓缩为一个查询（默认）
+#   "context": 直接用对话历史+检索内容构建上下文
+#   "react": Agent 模式，可使用工具
+
+chat_engine = index.as_chat_engine(
+    chat_mode="condense_question",
+    memory=ChatMemoryBuffer.from_defaults(token_limit=3000),  # 保留最近 3000 token 的对话
+    verbose=True,  # 打印内部处理过程
+)
+
+# ====== 2. 多轮对话 ======
+print("=== 第1轮 ===")
+response = chat_engine.chat("公司第一季度的收入是多少？")
+print(f"回答: {response}")
+
+print("\n=== 第2轮 ===")
+# 使用指代（"它"、"那个"），依赖上下文
+response = chat_engine.chat("第二季度相比有什么变化？")
+print(f"回答: {response}")
+
+print("\n=== 第3轮 ===")
+response = chat_engine.chat("研发人员有多少人？")
+print(f"回答: {response}")
+
+print("\n=== 第4轮 ===")
+# 结合多轮信息
+response = chat_engine.chat("总结一下公司的整体情况。")
+print(f"回答: {response}")
+
+# ====== 3. 重置对话 ======
+chat_engine.reset()
+print("\n=== 重置后 ===")
+response = chat_engine.chat("我刚才问了什么？")
+print(f"回答: {response}")
+
+
+# ====== 4. 流式 Chat Engine ======
+print("\n=== 流式对话 ===")
+streaming_chat = index.as_chat_engine(chat_mode="condense_question", streaming=True)
+response = streaming_chat.stream_chat("简单介绍一下公司")
+for token in response.response_gen:
+    print(token, end="", flush=True)
+print()
+```
+
+---
+
+## 7.4 LangChain vs LlamaIndex 选型指南
+
+### 7.4.1 对比总表
+
+| 维度 | LangChain | LlamaIndex |
+|------|-----------|------------|
+| **核心定位** | 通用 LLM 应用框架 | 数据索引与检索框架 |
+| **优势** | Agent、工具调用、多步链编排 | 文档索引、多索引类型、元数据管理 |
+| **检索能力** | 基础的向量检索 | 丰富的索引类型 + 检索策略 |
+| **Agent** | 成熟的 Agent 框架 + 工具生态 | 基础的 Agent 支持 |
+| **Prompt 管理** | Prompt Template + Hub | Query Prompt 自定义 |
+| **流式输出** | 原生 stream() + astream() | streaming=True 参数 |
+| **学习曲线** | 较陡（概念多、API 变化快） | 较平缓（接口简洁） |
+| **最佳场景** | 复杂 Agent 工作流、多工具编排 | 知识库问答、文档分析 |
+
+### 7.4.2 何时用哪个
+
+**用 LangChain 的场景**:
+- 需要 LLM + 多工具调用（搜索、计算、API 调用等）
+- 需要复杂的多步链（先A后B再C，根据结果决定分支）
+- 需要自定义 Agent 行为（记忆、规划、反思等）
+- 项目已有 LangChain 生态（LangSmith 监控、LangServe 部署等）
+
+**用 LlamaIndex 的场景**:
+- 核心需求是"对我的文档集提问"
+- 需要多种索引策略（向量检索 + 关键词检索 + 树形总结）
+- 需要丰富的元数据过滤和管理
+- 需要快速构建可工作的 RAG 原型
+
+**两者结合的场景（推荐）**:
+- 用 **LlamaIndex** 构建索引和检索层（它在这块更专业）
+- 用 **LangChain** 构建 Agent 和应用编排层（它在这块更灵活）
+- 两者可以通过 `LlamaIndexTool` 互操作
+
+### 7.4.3 混合使用示例
+
+```python
+"""
+ex_7_17_hybrid.py: LangChain + LlamaIndex 混合使用
+演示：LlamaIndex 负责索引检索，LangChain 负责 Agent 编排
+"""
+from llama_index.core import VectorStoreIndex, Document, Settings
+from llama_index.llms.openai import OpenAI as LlamaOpenAI
+from llama_index.embeddings.openai import OpenAIEmbedding as LlamaEmbedding
+from llama_index.core.tools import QueryEngineTool, ToolMetadata
+
+from langchain_openai import ChatOpenAI
+from langchain.agents import AgentExecutor, create_tool_calling_agent
+from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
+from langchain_core.tools import tool
+import datetime
+
+# ====== 1. LlamaIndex: 构建知识库索引 ======
+Settings.llm = LlamaOpenAI(model="gpt-4o-mini", temperature=0)
+Settings.embed_model = LlamaEmbedding(model="text-embedding-3-small")
+
+# 产品知识库
+product_docs = [
+    Document(text="ProductX 是一款企业级项目管理工具，支持甘特图、看板和敏捷看板。价格从 $29/月 起。"),
+    Document(text="ProductX 的退款政策: 购买后 30 天内可无理由全额退款。年付用户享受 20% 折扣。"),
+    Document(text="ProductX 支持集成 Slack、Jira、GitHub、GitLab 等第三方工具。API 文档在 docs.productx.com。"),
+]
+
+# 技术文档
+tech_docs = [
+    Document(text="ProductX 的 API 使用 RESTful 风格，认证方式为 Bearer Token。API Base URL: https://api.productx.com/v1"),
+    Document(text="创建项目: POST /projects, 获取项目列表: GET /projects, 删除项目: DELETE /projects/{id}"),
+]
+
+# 分别建索引
+product_index = VectorStoreIndex.from_documents(product_docs)
+tech_index = VectorStoreIndex.from_documents(tech_docs)
+
+# 包装为 LlamaIndex QueryEngineTool
+product_tool = QueryEngineTool.from_defaults(
+    query_engine=product_index.as_query_engine(),
+    name="product_knowledge",
+    description="搜索产品信息、功能、价格、退款政策等。",
+)
+
+tech_tool = QueryEngineTool.from_defaults(
+    query_engine=tech_index.as_query_engine(),
+    name="technical_docs",
+    description="搜索 API 文档、技术集成细节。",
+)
+
+# ====== 2. LangChain: 构建 Agent ======
+# 将 LlamaIndex 工具转换为 LangChain 工具
+@tool
+def query_product_knowledge(query: str) -> str:
+    """搜索产品知识库：产品信息、功能、价格、退款政策。"""
+    return str(product_tool.query_engine.query(query))
+
+@tool
+def query_technical_docs(query: str) -> str:
+    """搜索技术文档：API 使用方法、集成方案。"""
+    return str(tech_tool.query_engine.query(query))
+
+@tool
+def get_current_time(format: str = "%Y-%m-%d %H:%M:%S") -> str:
+    """获取当前时间。"""
+    return datetime.datetime.now().strftime(format)
+
+# 创建 Agent
+llm = ChatOpenAI(model="gpt-4o", temperature=0)
+tools = [query_product_knowledge, query_technical_docs, get_current_time]
+
+prompt = ChatPromptTemplate.from_messages([
+    ("system", "你是 ProductX 的智能客服。用产品知识库和技术文档回答问题。"),
+    MessagesPlaceholder(variable_name="agent_scratchpad"),
+    ("human", "{input}"),
+])
+
+agent = create_tool_calling_agent(llm, tools, prompt)
+executor = AgentExecutor(agent=agent, tools=tools, verbose=True)
+
+# 测试
+result = executor.invoke({
+    "input": "ProductX 多少钱？支持退款吗？另外我可以用 API 创建项目吗？"
+})
+print(f"\n最终回复: {result['output']}")
+```
+
+---
+
+## 基础练习
+
+### 练习 1: 简单 RAG 问答系统
+
+用 LangChain + LCEL 构建一个问答系统：加载本地 TXT 文件 → 切分 → 向量化 → 检索 → 生成答案。
+
+**练习文件**: `exercise/ai-application/ch07_langchain_llamaindex/ex_simple_rag.py`
+
+### 练习 2: LlamaIndex 文档索引查询
+
+用 LlamaIndex 加载一个目录中的 Markdown 文档建索引，实现关键词+语义的双路检索，并支持按文档来源过滤。
+
+**练习文件**: `exercise/ai-application/ch07_langchain_llamaindex/ex_doc_index.py`
+
+### 练习 3: 带工具的 Agent
+
+使用 LangChain 创建一个 Agent，配备计算器、日期查询、单位换算三个工具。测试多步推理问题。
+
+**练习文件**: `exercise/ai-application/ch07_langchain_llamaindex/ex_agent_tools.py`
+
+---
+
+## 进阶练习
+
+### 练习 4: 多源 RAG（文档+网页+数据库）
+
+构建一个从多个数据源（本地文件、指定 URL 网页、SQLite 数据库）检索的 RAG 系统，用 LangChain 的 EnsembleRetriever 合并不同检索器的结果。
+
+**练习文件**: `exercise/ai-application/ch07_langchain_llamaindex/ex_multi_source_rag.py`
+
+### 练习 5: Agentic RAG（Agent 驱动的 RAG）
+
+结合 LangChain Agent + LlamaIndex 索引，实现一个"智能研究助手"：用户给出一个研究主题 → Agent 自动分解子问题 → 查知识库 → 查外部搜索 → 汇总生成研究报告。
+
+**练习文件**: `exercise/ai-application/ch07_langchain_llamaindex/ex_research_assistant.py`
+
+---
+
+## 常见错误
+
+### 错误 1: 混淆 LangChain 和 OpenAI 原生的消息格式
+
+```python
+# 错误: 直接传 dict 给 ChatOpenAI
+llm.invoke([{"role": "user", "content": "Hello"}])
+# → AttributeError
+
+# 正确: 使用 LangChain 的消息对象
+from langchain_core.messages import HumanMessage
+llm.invoke([HumanMessage(content="Hello")])
+```
+
+### 错误 2: LCEL 中字典 key 不匹配
+
+```python
+# 错误: Prompt 模板要求 {topic}，但 invoke 时传入 {subject}
+prompt = ChatPromptTemplate.from_template("讲讲{topic}")
+chain = prompt | llm
+chain.invoke({"subject": "Python"})  # → KeyError: 'topic'
+
+# 正确: 保持 key 一致
+chain.invoke({"topic": "Python"})
+```
+
+### 错误 3: 向量库重复插入数据
+
+```python
+# 错误: 每次启动都运行 from_documents，导致重复数据
+vectorstore = Chroma.from_documents(docs, embeddings, persist_directory="./db")
+# 第2次运行时，数据库里有两份相同数据 → 检索结果是两份重复的
+
+# 正确: 检查是否已有数据，有则加载，无则创建
+import os
+if os.path.exists("./db") and os.listdir("./db"):
+    vectorstore = Chroma(persist_directory="./db", embedding_function=embeddings)
+else:
+    vectorstore = Chroma.from_documents(docs, embeddings, persist_directory="./db")
+```
+
+### 错误 4: Agent 陷入无限循环
+
+```python
+# 错误: 工具返回的结果不符合 LLM 预期，导致 Agent 反复调用同一个工具
+# 症状: verbose=True 时看到不断重复 Thought → Action → Observation → Thought...
+
+# 解决:
+executor = AgentExecutor(
+    agent=agent,
+    tools=tools,
+    max_iterations=10,    # 限制最大迭代次数
+    max_execution_time=30, # 限制最大执行时间
+    return_intermediate_steps=True,  # 返回中间步骤便于调试
+    handle_parsing_errors=True,      # 处理 LLM 输出格式错误
+)
+```
+
+### 错误 5: LlamaIndex 的 Document 与 LangChain 的 Document 混淆
+
+```python
+# 错误: 用 LangChain 的 Document 创建 LlamaIndex 的索引
+from langchain_core.documents import Document as LCDocument
+from llama_index.core import VectorStoreIndex
+docs = [LCDocument(page_content="...")]
+index = VectorStoreIndex.from_documents(docs)  # → 类型错误
+
+# 正确: 使用对应框架的 Document
+from llama_index.core import Document as LIDocument
+docs = [LIDocument(text="...")]
+index = VectorStoreIndex.from_documents(docs)
+```
+
+### 错误 6: 忘记设置 LLM 和 Embedding
+
+```python
+# 错误: LlamaIndex 默认使用 OpenAI 的模型，但如果没有 API Key 会报错
+from llama_index.core import VectorStoreIndex
+index = VectorStoreIndex.from_documents(docs)
+# → OpenAI API key not found
+
+# 正确: 在代码开始处设置
+from llama_index.core import Settings
+from llama_index.llms.openai import OpenAI
+from llama_index.embeddings.openai import OpenAIEmbedding
+Settings.llm = OpenAI(model="gpt-4o-mini")
+Settings.embed_model = OpenAIEmbedding(model="text-embedding-3-small")
+```
+
+---
+
+## 本章小结
+
+本章系统性地介绍了 LLM 应用开发的两个核心框架：
+
+1. **LangChain** 是一套通用的 LLM 编排工具，核心模块包括：
+   - **Model I/O**: Prompt Template、Chat Model、Output Parser，处理模型输入输出的标准化
+   - **Retrieval**: Document Loader → Text Splitter → Embedding → Vector Store → Retriever 五层架构
+   - **Chains**: 将多个步骤串联成流水线，LCEL 管道语法实现声明式编排
+   - **Agents**: 让 LLM 自主选择和使用工具，实现复杂任务的自动规划与执行
+
+2. **LCEL** 是 LangChain 的现代 API，通过 `|` 管道符和 `Runnable` 接口提供：
+   - 统一的 `invoke()/batch()/stream()` 调用模式
+   - `RunnableParallel` 并行执行
+   - `RunnablePassthrough` 透传和 `RunnableLambda` 自定义函数注入
+
+3. **LlamaIndex** 专注于数据索引与检索，提供：
+   - 多种索引类型（向量、摘要、树形、关键词表）
+   - 丰富的查询引擎和 Chat Engine
+   - 子问题拆解和多索引路由
+
+4. **选型建议**:
+   - 数据检索为主 → LlamaIndex（索引更专业）
+   - Agent/多工具编排 → LangChain（Agent 更成熟）
+   - 复杂应用 → 两者结合（LlamaIndex 做索引层，LangChain 做编排层）
+
+---
+
+**下一章**: 第08章 AI 应用 Web 化——将 AI 能力部署为 Web 服务。
